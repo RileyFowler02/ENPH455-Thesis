@@ -1,3 +1,4 @@
 /.venv
 /patients
 __pycache__
+.DS_Store
