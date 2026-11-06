@@ -1,42 +1,57 @@
 """Discover, validate, repair, and optionally normalize lumbar-spine DICOM data.
 
+--------------------------------------------------------------------------------------
+
 The input tree is treated as read-only.  DICOM headers, rather than arbitrary
 folder names, determine which files belong to each image series.  This is
 important because a patient can have multiple series with similar names, and
 the filename order is not guaranteed to be the physical slice order.
+
+--------------------------------------------------------------------------------------
 
 Typical usage:
 
     python preprocessor.py discover --input patients --manifest manifest.csv
     python preprocessor.py repair --input patients --output repaired
 
-The ``discover`` command creates an auditable CSV manifest.  The ``repair``
-command creates corrected DICOM copies without modifying the input.  The
-optional ``normalize`` command creates NumPy volumes and sidecar JSON files.
-Normalization is kept separate from DICOM repair so the original voxel values
-and spacing remain available for quantitative measurements.
+--------------------------------------------------------------------------------------
+
+discover:
+    - Find all DICOM files
+    - Identify the patient they belong to
+    - Determine whether they are axial/sagittal/coronal (don't know if there are any) and T1/T2
+    - Organize their slices in the correct physical order
+
+repair:
+    - Create corrected copies of the DICOM files so that 3DSlicer can interpret and import them more reliably
+
+normalize:
+    - Covert selected MRI series into 3D numpy arrays
+    - adjusts their spatial resolution
+    - standardizes their intensity values for later ML applications
+
 """
 
-from __future__ import annotations
+from __future__ import annotations # used for type annotations
 
-import argparse
-import csv
-import importlib
-import json
-import logging
+import argparse # lets me run commands with terminal args
+import csv # used to create the terminal manifest
+import importlib # imports optional libraries when needed
+import json # used for creating metadata files aloingside the normalized volumes
+import logging # warnings/errors
 import math
-import re
+import re # searches text
 import sys
-from collections import defaultdict
-from dataclasses import dataclass, field
+from collections import defaultdict # lets me create an empty list when accessing a new key (i.e., patient#1 - nnnnnnnnn)
+from dataclasses import dataclass, field # used to build patient objects into a class struct, allows me to then customize how certain class attributes are initialized
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence # lets me iterate over an object, lists and tuples
 
-import pydicom
-from pydicom.dataset import FileDataset
-from pydicom.dataset import FileMetaDataset
-from pydicom.errors import InvalidDicomError
-from pydicom.uid import ExplicitVRLittleEndian, generate_uid
+import pydicom # library that lets python read and manipulate DICOMs
+from pydicom.dataset import FileDataset # represents the contents of a DICOM file, including metadata and image pixels
+from pydicom.dataset import FileMetaDataset # represents the file-level metadata, including how it is encoded and stored
+from pydicom.errors import InvalidDicomError # error handling
+from pydicom.uid import ExplicitVRLittleEndian, generate_uid # identifies a particular DICOM transfer syntax (how data is encoded), used for creating unique IDs
 
 LOG = logging.getLogger("preprocessor")
 # This expression recognizes only standalone T1/T2 tokens, avoiding accidental
