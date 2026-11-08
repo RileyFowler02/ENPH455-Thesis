@@ -30,6 +30,7 @@ normalize:
     - adjusts their spatial resolution
     - standardizes their intensity values for later ML applications
 
+--------------------------------------------------------------------------------------
 """
 
 from __future__ import annotations # used for type annotations
@@ -53,12 +54,11 @@ from pydicom.dataset import FileMetaDataset # represents the file-level metadata
 from pydicom.errors import InvalidDicomError # error handling
 from pydicom.uid import ExplicitVRLittleEndian, generate_uid # identifies a particular DICOM transfer syntax (how data is encoded), used for creating unique IDs
 
-LOG = logging.getLogger("preprocessor")
-# This expression recognizes only standalone T1/T2 tokens, avoiding accidental
-# matches inside unrelated words.
-CONTRAST_RE = re.compile(r"\b(T1|T2)\b", re.IGNORECASE)
+LOG = logging.getLogger("preprocessor") # initialize logger
 
+CONTRAST_RE = re.compile(r"\b(T1|T2)\b", re.IGNORECASE) # Recognizes only standalone T1/T2 tokens, avoiding accidental matches inside unrelated words. Not perfect solution, but hopefully should work
 
+# DATA STRUCTURES
 @dataclass
 class SliceInfo:
     """Metadata needed to locate and order one DICOM image.
@@ -68,13 +68,13 @@ class SliceInfo:
     numbers, which may contain gaps or start at a non-zero value.
     """
 
-    # Original file location; the source dataset is never overwritten.
+    # Original file location such that the source dataset is never overwritten
     path: Path
-    # Header-only dataset used during discovery and validation.
+    # Header-only dataset used during discovery and validation
     dataset: FileDataset
-    # Physical coordinate used for deterministic slice ordering.
+    # Physical coordinate used for deterministic slice ordering
     projection: float
-    # DICOM's displayed sequence number, retained as a fallback tie-breaker.
+    # DICOM's displayed sequence number, retained as a fallback tie-breaker in case the physical coordinates don't work
     instance_number: int
 
 
@@ -84,7 +84,7 @@ class Series:
 
     # Patient and series identifiers come from DICOM, not directory names.
     patient_id: str
-    series_uid: str
+    series_uid: str # i.e., T2 Axial, T2 Sagittal
     # Retained for auditability and troubleshooting.
     source_folder: str
     description: str
@@ -99,7 +99,7 @@ class Series:
     slice_thickness: float | None
     spacing_between_slices: float | None
     # These are populated after the series is created.
-    slices: list[SliceInfo] = field(default_factory=list)
+    slices: list[SliceInfo] = field(default_factory=list) # default_factory flag makes an independent list for each new series
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -114,7 +114,7 @@ class Series:
         """Return a stable ordering for manifest rows and output folders."""
         return (self.patient_id, self.label, self.series_uid)
 
-
+# DICOM HELPER FUNCTIONS
 def _text(ds: FileDataset, name: str) -> str:
     """Read a DICOM text attribute and convert missing values to ``""``."""
     value = getattr(ds, name, "")
@@ -130,7 +130,7 @@ def _float(value: object, default: float | None = None) -> float | None:
 
 
 def _orientation(ds: FileDataset) -> tuple[float, ...] | None:
-    """Return the six orientation-cosine values when they are valid."""
+    """Return the six orientation-cosine values when they are valid"""
     try:
         values = tuple(float(v) for v in ds.ImageOrientationPatient)
         return values if len(values) == 6 else None
@@ -138,6 +138,7 @@ def _orientation(ds: FileDataset) -> tuple[float, ...] | None:
         return None
 
 
+# COMPUTATIONS
 def infer_view(ds: FileDataset) -> str:
     """Infer axial, coronal, or sagittal orientation from DICOM geometry.
 
