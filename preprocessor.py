@@ -1,209 +1,139 @@
-"""Discover, validate, repair, and optionally normalize lumbar-spine DICOM data.
+"""Discover, audit, repair, and geometry-preserving export of lumbar MRI DICOM.
 
---------------------------------------------------------------------------------------
+The source tree is never modified.  The reference CSV files supplied with the
+dataset are authoritative for study/series descriptions and label coordinates;
+DICOM geometry remains authoritative for physical image reconstruction.
 
-The input tree is treated as read-only.  DICOM headers, rather than arbitrary
-folder names, determine which files belong to each image series.  This is
-important because a patient can have multiple series with similar names, and
-the filename order is not guaranteed to be the physical slice order.
-
---------------------------------------------------------------------------------------
-
-Typical usage:
+Examples:
 
     python preprocessor.py discover --input patients --manifest manifest.csv
     python preprocessor.py repair --input patients --output repaired
+    python preprocessor.py normalize --input repaired --output normalized
 
---------------------------------------------------------------------------------------
-
-discover:
-    - Find all DICOM files
-    - Identify the patient they belong to
-    - Determine whether they are axial/sagittal/coronal (don't know if there are any) and T1/T2
-    - Organize their slices in the correct physical order
-
-repair:
-    - Create corrected copies of the DICOM files so that 3DSlicer can interpret and import them more reliably
-
-normalize:
-    - Covert selected MRI series into 3D numpy arrays
-    - adjusts their spatial resolution
-    - standardizes their intensity values for later ML applications
-
---------------------------------------------------------------------------------------
+``normalize`` writes NIfTI (RAS affine) plus JSON provenance.  It preserves
+raw modality-corrected intensities by default; z-score normalization is an
+explicit option for machine-learning experiments and must not replace the
+original or repaired DICOM.
 """
 
-from __future__ import annotations # used for type annotations
+from __future__ import annotations
 
-import argparse # lets me run commands with terminal args
-import csv # used to create the terminal manifest
-import importlib # imports optional libraries when needed
-import json # used for creating metadata files aloingside the normalized volumes
-import logging # warnings/errors
+import argparse
+import csv
+import importlib
+import json
+import logging
 import math
-import re # searches text
+import re
 import sys
-from collections import defaultdict # lets me create an empty list when accessing a new key (i.e., patient#1 - nnnnnnnnn)
-from dataclasses import dataclass, field # used to build patient objects into a class struct, allows me to then customize how certain class attributes are initialized
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence # lets me iterate over an object, lists and tuples
+from typing import Iterable, Sequence
 
-import pydicom # library that lets python read and manipulate DICOMs
-from pydicom.dataset import FileDataset # represents the contents of a DICOM file, including metadata and image pixels
-from pydicom.dataset import FileMetaDataset # represents the file-level metadata, including how it is encoded and stored
-from pydicom.errors import InvalidDicomError # error handling
-from pydicom.uid import ExplicitVRLittleEndian, generate_uid # identifies a particular DICOM transfer syntax (how data is encoded), used for creating unique IDs
+import pydicom
+from pydicom.dataset import FileDataset, FileMetaDataset
+from pydicom.errors import InvalidDicomError
+from pydicom.pixels.processing import apply_modality_lut
+from pydicom.uid import generate_uid
 
-LOG = logging.getLogger("preprocessor") # initialize logger
+LOG = logging.getLogger("preprocessor")
 
-CONTRAST_RE = re.compile(r"\b(T1|T2)\b", re.IGNORECASE) # Recognizes only standalone T1/T2 tokens, avoiding accidental matches inside unrelated words. Not perfect solution, but hopefully should work
 
-# DATA STRUCTURES
+@dataclass(frozen=True)
+class ReferenceSeries:
+    study_id: str
+    series_id: str
+    description: str
+
+
 @dataclass
 class SliceInfo:
-    """Metadata needed to locate and order one DICOM image.
-
-    ``projection`` is the image position projected onto the series normal.
-    Sorting by it is more reliable than sorting by filenames or instance
-    numbers, which may contain gaps or start at a non-zero value.
-    """
-
-    # Original file location such that the source dataset is never overwritten
     path: Path
-    # Header-only dataset used during discovery and validation
     dataset: FileDataset
-    # Physical coordinate used for deterministic slice ordering
     projection: float
-    # DICOM's displayed sequence number, retained as a fallback tie-breaker in case the physical coordinates don't work
     instance_number: int
 
 
 @dataclass
 class Series:
-    """Description of one DICOM series and its ordered slices."""
-
-    # Patient and series identifiers come from DICOM, not directory names.
     patient_id: str
-    series_uid: str # i.e., T2 Axial, T2 Sagittal
-    # Retained for auditability and troubleshooting.
+    series_uid: str
+    study_uid: str
     source_folder: str
     description: str
     protocol: str
-    # Inferred from orientation and contrast metadata respectively.
-    view: str
-    contrast: str
-    # Image geometry needed for resampling and physical measurements.
     rows: int
     columns: int
     pixel_spacing: tuple[float, float]
     slice_thickness: float | None
     spacing_between_slices: float | None
-    # These are populated after the series is created.
-    slices: list[SliceInfo] = field(default_factory=list) # default_factory flag makes an independent list for each new series
+    reference: ReferenceSeries | None = None
+    coordinate_count: int = 0
+    part_index: int = 1
+    train_labels: dict[str, str] = field(default_factory=dict)
+    slices: list[SliceInfo] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     @property
     def label(self) -> str:
-        """Return a readable label such as ``T2_axial`` for output names."""
-        contrast = self.contrast if self.contrast != "unknown" else "unknown"
-        view = self.view if self.view != "unknown" else "unknown-view"
-        return f"{contrast}_{view}"
+        """Return the dataset description from the reference CSV, not an inference."""
+        if self.reference is None:
+            return "unreferenced"
+        return _safe_id(self.reference.description.lower().replace("/", "-"))
 
     @property
     def sort_key(self) -> tuple[str, str, str]:
-        """Return a stable ordering for manifest rows and output folders."""
-        return (self.patient_id, self.label, self.series_uid)
+        return self.patient_id, self.label, f"{self.series_uid}:{self.part_index}"
 
-# DICOM HELPER FUNCTIONS
+
 def _text(ds: FileDataset, name: str) -> str:
-    """Read a DICOM text attribute and convert missing values to ``""``."""
     value = getattr(ds, name, "")
     return str(value).strip() if value is not None else ""
 
 
 def _float(value: object, default: float | None = None) -> float | None:
-    """Convert a DICOM numeric value while handling missing/malformed values."""
     try:
-        return float(value)  # type: ignore[arg-type]
+        result = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
+    return result if math.isfinite(result) else default
 
 
 def _orientation(ds: FileDataset) -> tuple[float, ...] | None:
-    """Return the six orientation-cosine values when they are valid"""
     try:
         values = tuple(float(v) for v in ds.ImageOrientationPatient)
-        return values if len(values) == 6 else None
     except (AttributeError, TypeError, ValueError):
         return None
+    return values if len(values) == 6 and all(math.isfinite(v) for v in values) else None
 
 
-# COMPUTATIONS
-def infer_view(ds: FileDataset) -> str:
-    """Infer axial, coronal, or sagittal orientation from DICOM geometry.
+def _position(ds: FileDataset) -> tuple[float, float, float] | None:
+    try:
+        values = tuple(float(v) for v in ds.ImagePositionPatient)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return values if len(values) == 3 and all(math.isfinite(v) for v in values) else None
 
-    ``ImageOrientationPatient`` contains direction cosines for the image row
-    and column.  Their cross product is the normal to the image plane.  The
-    dominant patient axis of that normal identifies the view:
 
-    * normal along X -> sagittal
-    * normal along Y -> coronal
-    * normal along Z -> axial
-
-    A missing or malformed orientation is reported as ``"unknown"`` rather
-    than guessed from a directory name.
-    """
-    orientation = _orientation(ds)
-    if orientation is None:
-        return "unknown"
+def _normal(orientation: tuple[float, ...]) -> tuple[float, float, float]:
     row, column = orientation[:3], orientation[3:]
-    normal = (
+    return (
         row[1] * column[2] - row[2] * column[1],
         row[2] * column[0] - row[0] * column[2],
         row[0] * column[1] - row[1] * column[0],
     )
-    dominant_axis = max(range(3), key=lambda index: abs(normal[index]))
-    return ("sagittal", "coronal", "axial")[dominant_axis]
-
-
-def infer_contrast(ds: FileDataset) -> str:
-    """Infer T1/T2 contrast from descriptive DICOM fields.
-
-    This is deliberately conservative.  If no standalone T1 or T2 token is
-    found, ``"unknown"`` is returned so a human can review the manifest.
-    """
-    fields = (_text(ds, "SeriesDescription"), _text(ds, "ProtocolName"),
-              _text(ds, "SequenceName"))
-    text = " ".join(fields).upper()
-    matches = CONTRAST_RE.findall(text)
-    return matches[0].upper() if matches else "unknown"
 
 
 def _projection(ds: FileDataset) -> float:
-    """Return a physical coordinate used to order slices in one series.
-
-    The image position is projected onto the series normal.  This makes slice
-    ordering work even when filenames are non-sequential.  ``SliceLocation``
-    is used only as a fallback when the geometric tags are unavailable.
-    """
-    try:
-        orientation = _orientation(ds)
-        position = tuple(float(v) for v in ds.ImagePositionPatient)
-        if orientation is None or len(position) != 3:
-            return _float(getattr(ds, "SliceLocation", 0), 0) or 0
-        row, column = orientation[:3], orientation[3:]
-        normal = (
-            row[1] * column[2] - row[2] * column[1],
-            row[2] * column[0] - row[0] * column[2],
-            row[0] * column[1] - row[1] * column[0],
-        )
-        return sum(a * b for a, b in zip(position, normal))
-    except (AttributeError, TypeError, ValueError):
-        return 0
+    orientation = _orientation(ds)
+    position = _position(ds)
+    if orientation is not None and position is not None:
+        return sum(a * b for a, b in zip(position, _normal(orientation)))
+    return _float(getattr(ds, "SliceLocation", None), 0.0) or 0.0
 
 
 def _read_header(path: Path) -> FileDataset | None:
-    """Read only DICOM headers so discovery does not load pixel arrays."""
     try:
         return pydicom.dcmread(path, stop_before_pixels=True, force=True)
     except (OSError, InvalidDicomError, ValueError) as exc:
@@ -211,235 +141,387 @@ def _read_header(path: Path) -> FileDataset | None:
         return None
 
 
-def discover_series(input_root: Path) -> list[Series]:
-    """Discover and validate all DICOM series below ``input_root``.
+def _read_reference_series(path: Path) -> dict[tuple[str, str], ReferenceSeries]:
+    if not path.is_file():
+        LOG.warning("Reference series CSV not found: %s", path)
+        return {}
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        return {
+            (row["study_id"].strip(), row["series_id"].strip()): ReferenceSeries(
+                row["study_id"].strip(), row["series_id"].strip(),
+                row["series_description"].strip(),
+            )
+            for row in csv.DictReader(handle)
+            if row.get("study_id") and row.get("series_id")
+        }
 
-    Files are grouped by ``(PatientID, SeriesInstanceUID)``.  A missing series
-    UID receives a synthetic group key so files are not silently discarded,
-    while the resulting manifest makes the missing identifier visible.
+
+def _read_coordinate_counts(path: Path) -> dict[tuple[str, str], int]:
+    if not path.is_file():
+        LOG.warning("Reference coordinate CSV not found: %s", path)
+        return {}
+    counts: dict[tuple[str, str], int] = defaultdict(int)
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            if row.get("study_id") and row.get("series_id"):
+                counts[(row["study_id"].strip(), row["series_id"].strip())] += 1
+    return dict(counts)
+
+
+def _read_train_labels(path: Path) -> dict[str, dict[str, str]]:
+    if not path.is_file():
+        LOG.warning("Training label CSV not found: %s", path)
+        return {}
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        return {
+            row["study_id"].strip(): {
+                key: value.strip() for key, value in row.items()
+                if key != "study_id" and value is not None
+            }
+            for row in csv.DictReader(handle)
+            if row.get("study_id")
+        }
+
+
+def _reference_key(patient_id: str, series_uid: str) -> tuple[str, str]:
+    """Return the dataset key used by the CSVs for a DICOM series.
+
+    The competition data stores the numeric series directory/identifier, while
+    some DICOM exports prepend an implementation-specific root to the UID.
     """
-    # The value stores both the path and header because both are needed later.
-    grouped: dict[tuple[str, str], list[tuple[Path, FileDataset]]] = defaultdict(list)
-    # rglob supports the nested patient/series layout and future deeper layouts.
+    return patient_id, series_uid
+
+
+def _reference_for(
+    patient_id: str, series_uid: str, references: dict[tuple[str, str], ReferenceSeries],
+) -> ReferenceSeries | None:
+    candidates = (
+        _reference_key(patient_id, series_uid),
+        _reference_key(patient_id, series_uid.rsplit(".", 1)[-1]),
+    )
+    return next((references[key] for key in candidates if key in references), None)
+
+
+def _coordinate_count_for(
+    patient_id: str, series_uid: str, coordinates: dict[tuple[str, str], int],
+) -> int:
+    candidates = (
+        _reference_key(patient_id, series_uid),
+        _reference_key(patient_id, series_uid.rsplit(".", 1)[-1]),
+    )
+    return next((coordinates[key] for key in candidates if key in coordinates), 0)
+
+
+def discover_series(
+    input_root: Path,
+    series_descriptions: Path | None = None,
+    label_coordinates: Path | None = None,
+    train_labels: Path | None = None,
+) -> list[Series]:
+    """Discover series and attach the supplied reference metadata."""
+    references = _read_reference_series(series_descriptions) if series_descriptions else {}
+    coordinates = _read_coordinate_counts(label_coordinates) if label_coordinates else {}
+    labels = _read_train_labels(train_labels) if train_labels else {}
+    grouped: dict[tuple[str, str, tuple[float, ...] | None], list[tuple[Path, FileDataset]]] = defaultdict(list)
     for path in sorted(input_root.rglob("*.dcm")):
         ds = _read_header(path)
         if ds is None:
             continue
-        # PatientID is authoritative; the path fallback supports malformed data.
-        patient_id = _text(ds, "PatientID") or path.parts[-3]
-        series_uid = _text(ds, "SeriesInstanceUID")
-        if not series_uid:
-            series_uid = f"missing-uid-{path.parent}"
-        grouped[(patient_id, series_uid)].append((path, ds))
+        patient_id = _text(ds, "PatientID") or (path.parts[-3] if len(path.parts) >= 3 else "unknown")
+        series_uid = _text(ds, "SeriesInstanceUID") or f"missing-uid-{path.parent}"
+        orientation = _orientation(ds)
+        orientation_key = tuple(round(value, 4) for value in orientation) if orientation else None
+        grouped[(patient_id, series_uid, orientation_key)].append((path, ds))
 
     result: list[Series] = []
-    for (patient_id, series_uid), files in grouped.items():
-        # One representative header supplies series-level geometry and labels.
+    part_numbers: dict[tuple[str, str], int] = defaultdict(int)
+    for (patient_id, series_uid, _), files in grouped.items():
+        part_numbers[(patient_id, series_uid)] += 1
         first = files[0][1]
-        view = infer_view(first)
-        rows = int(getattr(first, "Rows", 0) or 0)
-        columns = int(getattr(first, "Columns", 0) or 0)
         try:
-            pixel_spacing = tuple(float(v) for v in first.PixelSpacing)
-            if len(pixel_spacing) != 2:
+            spacing = tuple(float(v) for v in first.PixelSpacing)
+            if len(spacing) != 2 or any(v <= 0 or not math.isfinite(v) for v in spacing):
                 raise ValueError
+            pixel_spacing = spacing
         except (AttributeError, TypeError, ValueError):
-            # NaN preserves the fact that spacing was unavailable.
             pixel_spacing = (math.nan, math.nan)
+        reference = _reference_for(patient_id, series_uid, references)
         series = Series(
             patient_id=patient_id,
             series_uid=series_uid,
+            study_uid=_text(first, "StudyInstanceUID"),
             source_folder=str(files[0][0].parent),
             description=_text(first, "SeriesDescription"),
             protocol=_text(first, "ProtocolName"),
-            view=view,
-            contrast=infer_contrast(first),
-            rows=rows,
-            columns=columns,
+            rows=int(getattr(first, "Rows", 0) or 0),
+            columns=int(getattr(first, "Columns", 0) or 0),
             pixel_spacing=pixel_spacing,
             slice_thickness=_float(getattr(first, "SliceThickness", None)),
             spacing_between_slices=_float(getattr(first, "SpacingBetweenSlices", None)),
+            reference=reference,
+            coordinate_count=_coordinate_count_for(patient_id, series_uid, coordinates),
+            part_index=part_numbers[(patient_id, series_uid)],
+            train_labels=labels.get(patient_id, {}),
         )
+        if reference is None:
+            series.warnings.append("series not present in reference CSV")
         for path, ds in files:
-            # These checks flag inconsistent data without silently dropping it.
-            if infer_view(ds) != view:
-                series.warnings.append("inconsistent image orientation")
-            if (int(getattr(ds, "Rows", 0) or 0), int(getattr(ds, "Columns", 0) or 0)) != (rows, columns):
+            if (int(getattr(ds, "Rows", 0) or 0), int(getattr(ds, "Columns", 0) or 0)) != (
+                series.rows, series.columns
+            ):
                 series.warnings.append("inconsistent image dimensions")
-            series.slices.append(
-                SliceInfo(path, ds, _projection(ds), int(_float(getattr(ds, "InstanceNumber", 0), 0) or 0))
-            )
-        # Physical position is primary; instance number and path make ties stable.
+            try:
+                ps = tuple(float(v) for v in ds.PixelSpacing)
+                if ps != series.pixel_spacing:
+                    series.warnings.append("inconsistent pixel spacing")
+            except (AttributeError, TypeError, ValueError):
+                series.warnings.append("missing pixel spacing")
+            series.slices.append(SliceInfo(
+                path, ds, _projection(ds),
+                int(_float(getattr(ds, "InstanceNumber", 0), 0) or 0),
+            ))
         series.slices.sort(key=lambda item: (item.projection, item.instance_number, str(item.path)))
-        projections = [round(item.projection, 4) for item in series.slices]
-        if len(projections) != len(set(projections)):
+        projections = [item.projection for item in series.slices]
+        if len(projections) > 1:
+            gaps = [abs(b - a) for a, b in zip(projections, projections[1:]) if abs(b - a) > 1e-6]
+            if len(set(round(gap, 3) for gap in gaps)) > 1:
+                series.warnings.append("nonuniform slice spacing")
+        if len({round(value, 4) for value in projections}) != len(projections):
             series.warnings.append("duplicate slice positions")
-        # Sort the completed series list so repeated runs produce identical output.
         result.append(series)
     return sorted(result, key=lambda item: item.sort_key)
 
 
 def _manifest_row(series: Series) -> dict[str, object]:
-    """Convert a :class:`Series` into one CSV-compatible dictionary row."""
+    positions = [_position(info.dataset) for info in series.slices]
+    valid_positions = [position for position in positions if position is not None]
+    projections = [info.projection for info in series.slices]
+    gaps = [abs(b - a) for a, b in zip(projections, projections[1:]) if abs(b - a) > 1e-6]
     return {
         "patient_id": series.patient_id,
+        "study_uid": series.study_uid,
         "series_uid": series.series_uid,
+        "geometry_part": series.part_index,
+        "reference_series_id": series.reference.series_id if series.reference else "",
+        "reference_description": series.reference.description if series.reference else "",
+        "label_source": "reference_csv" if series.reference else "unreferenced",
+        "coordinate_count": series.coordinate_count,
+        "train_labels": json.dumps(series.train_labels, sort_keys=True),
         "label": series.label,
-        "view": series.view,
-        "contrast": series.contrast,
-        "description": series.description,
+        "dicom_description": series.description,
         "protocol": series.protocol,
         "file_count": len(series.slices),
         "rows": series.rows,
         "columns": series.columns,
-        "pixel_spacing": "x".join(str(v) for v in series.pixel_spacing),
-        "slice_thickness": series.slice_thickness,
-        "spacing_between_slices": series.spacing_between_slices,
+        "pixel_spacing_mm": json.dumps(series.pixel_spacing),
+        "slice_positions_patient_mm": json.dumps(valid_positions),
+        "slice_projections_mm": json.dumps(projections),
+        "slice_gap_min_mm": min(gaps) if gaps else "",
+        "slice_gap_max_mm": max(gaps) if gaps else "",
+        "slice_thickness_mm": series.slice_thickness or "",
         "source_folder": series.source_folder,
         "warnings": "; ".join(sorted(set(series.warnings))),
     }
 
 
 def write_manifest(series: Iterable[Series], destination: Path) -> None:
-    """Write one audit row per discovered series to ``destination``."""
-    # Materialize the iterable once because it may be a generator.
     rows = [_manifest_row(item) for item in series]
-    # Create parent folders so callers can choose nested output paths.
     destination.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(rows[0]) if rows else [
+        "patient_id", "study_uid", "series_uid", "geometry_part", "reference_series_id",
+        "reference_description", "label_source", "coordinate_count", "train_labels", "label",
+        "dicom_description", "protocol", "file_count", "rows", "columns",
+        "pixel_spacing_mm", "slice_positions_patient_mm", "slice_projections_mm",
+        "slice_gap_min_mm", "slice_gap_max_mm", "slice_thickness_mm",
+        "source_folder", "warnings",
+    ]
     with destination.open("w", newline="", encoding="utf-8") as handle:
-        # Keep a fixed schema, including when the input contains no series.
-        fieldnames = [
-            "patient_id", "series_uid", "label", "view", "contrast",
-            "description", "protocol", "file_count", "rows", "columns",
-            "pixel_spacing", "slice_thickness", "spacing_between_slices",
-            "source_folder", "warnings",
-        ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
 
+def write_slice_manifest(series: Iterable[Series], destination: Path) -> None:
+    """Write one row per source slice for audit and manual geometry review."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["patient_id", "study_uid", "series_uid", "geometry_part", "reference_description",
+              "slice_index", "source_file", "instance_number", "projection_mm",
+              "image_position_patient", "image_orientation_patient", "sop_instance_uid"]
+    with destination.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for item in series:
+            for index, info in enumerate(item.slices):
+                writer.writerow({
+                    "patient_id": item.patient_id, "study_uid": item.study_uid,
+                    "series_uid": item.series_uid,
+                    "geometry_part": item.part_index,
+                    "reference_description": item.reference.description if item.reference else "",
+                    "slice_index": index, "source_file": str(info.path),
+                    "instance_number": info.instance_number,
+                    "projection_mm": info.projection,
+                    "image_position_patient": json.dumps(_position(info.dataset)),
+                    "image_orientation_patient": json.dumps(_orientation(info.dataset)),
+                    "sop_instance_uid": _text(info.dataset, "SOPInstanceUID"),
+                })
+
+
 def _safe_id(value: str) -> str:
-    """Make a DICOM-derived identifier safe for use as a folder name."""
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "unknown"
 
 
-def repair_series(series: Series, output_root: Path, study_uid: str) -> Path:
-    """Write a repaired, ordered copy of ``series`` and return its folder.
-
-    The repair addresses viewer/import problems by supplying standard
-    patient/study/series descriptions and writing a complete DICOM file
-    format.  New UIDs distinguish the repaired copy from the source series.
-    """
-    # Keep patient folders separate and retain a short UID suffix for tracing.
+def repair_series(series: Series, output_root: Path) -> Path:
+    """Write a viewer-compatible copy while preserving source study grouping."""
     target = output_root / _safe_id(series.patient_id) / (
-        f"{series.label}_{_safe_id(series.series_uid[-12:])}"
+        f"{series.label}_{_safe_id(series.series_uid[-12:])}_part{series.part_index}"
     )
     target.mkdir(parents=True, exist_ok=True)
-    # All slices in this repaired output belong to one new series.
     repaired_series_uid = generate_uid()
     for index, info in enumerate(series.slices, start=1):
-        # Read pixel data and the complete dataset only when making a copy.
         ds = pydicom.dcmread(info.path, force=True)
-        # Populate identifiers that some viewers require for a valid patient.
         ds.PatientID = series.patient_id
         ds.PatientName = f"Patient_{series.patient_id}"
-        # Give the study and series meaningful labels in 3D Slicer.
-        ds.StudyDescription = "Lumbar spine MRI"
-        ds.SeriesDescription = f"{series.contrast} {series.view}"
-        ds.Modality = "MR"
-        # Use the same study but a new series UID for this repaired series.
+        ds.Modality = _text(ds, "Modality") or "MR"
         ds.SeriesInstanceUID = repaired_series_uid
-        ds.StudyInstanceUID = study_uid
-        ds.SeriesNumber = 1
-        # Replace gaps such as 18.dcm starting a series with 1, 2, 3, ...
+        if not _text(ds, "StudyInstanceUID"):
+            ds.StudyInstanceUID = generate_uid()
+        ds.SeriesDescription = series.reference.description if series.reference else series.description
+        ds.SeriesNumber = int(_float(getattr(ds, "SeriesNumber", 1), 1) or 1)
         ds.InstanceNumber = index
-        ds.ImageComments = "Series identified and ordered by preprocessor.py"
-        # Ensure a file-meta dataset exists before setting transfer syntax.
+        ds.ImageComments = "Ordered copy created by preprocessor.py; source study relationship preserved"
         if not getattr(ds, "file_meta", None):
             ds.file_meta = FileMetaDataset()
-        ds.file_meta.TransferSyntaxUID = getattr(
-            ds.file_meta, "TransferSyntaxUID", None
-        ) or ExplicitVRLittleEndian
-        # Link the file metadata to the stored SOP instance when available.
-        if hasattr(ds, "SOPInstanceUID"):
-            ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
-        # enforce_file_format writes the File Meta Information header/group length.
+        # Preserve the source transfer syntax.  No pixel conversion occurs here.
+        transfer_syntax = getattr(info.dataset.file_meta, "TransferSyntaxUID", None)
+        if transfer_syntax is not None:
+            ds.file_meta.TransferSyntaxUID = transfer_syntax
+        ds.SOPInstanceUID = generate_uid()
+        ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+        if _text(ds, "SOPClassUID"):
+            ds.file_meta.MediaStorageSOPClassUID = ds.SOPClassUID
         ds.save_as(target / f"{index:04d}.dcm", enforce_file_format=True)
     return target
 
 
-def _normalise_volume(series: Series, output: Path, target_spacing: tuple[float, float, float],
-                      lower: float, upper: float) -> None:
-    """Resample and intensity-normalize one series into a NumPy volume.
+def _metadata_path(output: Path) -> Path:
+    name = output.name[:-7] if output.name.endswith(".nii.gz") else output.stem
+    return output.with_name(name + ".json")
 
-    The output axis order is ``(slice, row, column)``.  Intensities are clipped
-    to the requested percentile range, resampled with cubic B-spline-like
-    interpolation through SciPy, and z-score normalized.  This is a useful
-    model-input baseline, not a substitute for validating an imaging protocol.
-    """
-    try:
-        # Lazy imports keep discovery/repair usable without numerical packages.
-        np = importlib.import_module("numpy")
-        zoom = importlib.import_module("scipy.ndimage").zoom
-    except ImportError as exc:
-        raise RuntimeError(
-            "normalize requires numpy and scipy; install them in the project environment"
-        ) from exc
-    # Pixel data is loaded only for the selected series.
+
+def _geometry(series: Series) -> tuple[tuple[float, ...], tuple[float, float, float], list[float]]:
+    if not series.slices or any(
+        (info.dataset.Rows, info.dataset.Columns) != (series.rows, series.columns)
+        for info in series.slices
+    ):
+        raise ValueError("all slices must have identical, valid dimensions")
+    orientations = [_orientation(info.dataset) for info in series.slices]
+    positions = [_position(info.dataset) for info in series.slices]
+    if any(value is None for value in orientations + positions):
+        raise ValueError("ImageOrientationPatient and ImagePositionPatient are required")
+    orientation = orientations[0]
+    assert orientation is not None
+    if any(max(abs(a - b) for a, b in zip(value, orientation)) > 1e-4 for value in orientations[1:] if value):
+        raise ValueError("slice orientations differ")
+    if any(not math.isfinite(value) or value <= 0 for value in series.pixel_spacing):
+        raise ValueError("valid PixelSpacing is required")
+    projections = [info.projection for info in series.slices]
+    gaps = [abs(b - a) for a, b in zip(projections, projections[1:]) if abs(b - a) > 1e-6]
+    if not gaps:
+        raise ValueError("at least two distinct slice positions are required")
+    spacing = (sum(gaps) / len(gaps), series.pixel_spacing[0], series.pixel_spacing[1])
+    return orientation, spacing, projections
+
+
+def _normalise_volume(
+    series: Series, output: Path, target_spacing: tuple[float, float, float],
+    lower: float, upper: float, intensity_mode: str, interpolation_order: int,
+) -> None:
+    """Resample to NIfTI while retaining an affine and the original slice geometry."""
+    if not 0 <= lower < upper <= 100:
+        raise ValueError("clip percentiles must satisfy 0 <= low < high <= 100")
+    if any(value <= 0 or not math.isfinite(value) for value in target_spacing):
+        raise ValueError("target spacing must contain three positive finite values")
+    np = importlib.import_module("numpy")
+    zoom = importlib.import_module("scipy.ndimage").zoom
+    nib = importlib.import_module("nibabel")
+    orientation, source_spacing, projections = _geometry(series)
     datasets = [pydicom.dcmread(info.path, force=True) for info in series.slices]
-    arrays = [ds.pixel_array.astype(np.float32) for ds in datasets]
+    arrays = []
+    for ds in datasets:
+        array = ds.pixel_array
+        try:
+            array = apply_modality_lut(array, ds)
+        except (AttributeError, ValueError):
+            slope = _float(getattr(ds, "RescaleSlope", 1), 1) or 1
+            intercept = _float(getattr(ds, "RescaleIntercept", 0), 0) or 0
+            array = array * slope + intercept
+        arrays.append(np.asarray(array, dtype=np.float32))
     volume = np.stack(arrays)
-    # DICOM stores in-plane spacing separately from through-plane spacing.
-    source_spacing = (
-        float(series.spacing_between_slices or series.slice_thickness or 1),
-        *series.pixel_spacing,
-    )
-    # zoom factors convert each source voxel dimension to target spacing.
     factors = tuple(source / target for source, target in zip(source_spacing, target_spacing))
-    volume = zoom(volume, factors, order=3)
-    # Percentile clipping reduces scanner-dependent outlier influence.
+    volume = zoom(volume, factors, order=interpolation_order)
     lo, hi = np.percentile(volume, (lower, upper))
     volume = np.clip(volume, lo, hi)
-    # Z-score normalization puts each volume on a comparable intensity scale.
     mean, std = float(volume.mean()), float(volume.std())
-    if std > 0:
+    if intensity_mode == "zscore" and std > 0:
         volume = (volume - mean) / std
-    # Store values and provenance separately so preprocessing is reproducible.
+
+    first_position = _position(datasets[0])
+    assert first_position is not None
+    row, column = orientation[:3], orientation[3:]
+    normal = _normal(orientation)
+    # DICOM array axes are (slice, row, column); convert the LPS affine to RAS.
+    lps = np.eye(4, dtype=float)
+    lps[:3, 0] = np.asarray(normal) * target_spacing[0]
+    lps[:3, 1] = np.asarray(column) * target_spacing[1]
+    lps[:3, 2] = np.asarray(row) * target_spacing[2]
+    lps[:3, 3] = first_position
+    ras = np.diag([-1.0, -1.0, 1.0, 1.0]) @ lps
     output.parent.mkdir(parents=True, exist_ok=True)
-    np.save(output, volume.astype(np.float32))
-    output.with_suffix(".json").write_text(json.dumps({
+    nib.save(nib.Nifti1Image(volume.astype(np.float32), ras), str(output))
+    _metadata_path(output).write_text(json.dumps({
         "patient_id": series.patient_id,
+        "study_uid": series.study_uid,
         "series_uid": series.series_uid,
-        "label": series.label,
+        "reference_description": series.reference.description if series.reference else None,
+        "source_files": [str(info.path) for info in series.slices],
+        "array_order": "slice, row, column",
+        "coordinate_system": "NIfTI RAS; source DICOM tags are LPS",
+        "image_position_patient_first_mm": first_position,
+        "image_orientation_patient": orientation,
+        "slice_positions_patient_mm": [_position(ds) for ds in datasets],
+        "slice_projections_mm": projections,
         "source_spacing_mm": source_spacing,
         "target_spacing_mm": target_spacing,
+        "nonuniform_slice_spacing": "nonuniform slice spacing" in series.warnings,
+        "intensity_mode": intensity_mode,
         "clip_percentiles": [lower, upper],
-        "z_score_mean": mean,
-        "z_score_std": std,
-        "array_order": "slice, row, column",
+        "clip_values": [float(lo), float(hi)],
+        "modality_lut_applied": True,
+        "interpolation_order": interpolation_order,
     }, indent=2) + "\n", encoding="utf-8")
 
 
 def _parse_spacing(value: str) -> tuple[float, float, float]:
-    """Parse ``slice,row,column`` spacing supplied on the command line."""
-    parts = tuple(float(part) for part in value.split(","))
-    if len(parts) != 3 or any(part <= 0 for part in parts):
+    try:
+        parts = tuple(float(part) for part in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("spacing must be three positive comma-separated values") from exc
+    if len(parts) != 3 or any(part <= 0 or not math.isfinite(part) for part in parts):
         raise argparse.ArgumentTypeError("spacing must be three positive comma-separated values")
     return parts
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Parse command-line arguments and execute the selected pipeline stage."""
-    # The module docstring becomes the command's help text.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verbose", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("discover", "repair", "normalize"):
-        # Shared options are defined on every subcommand for convenient usage.
         sub = subparsers.add_parser(command)
         sub.add_argument("--input", type=Path, default=Path("patients"))
         sub.add_argument("--manifest", type=Path, default=Path("manifest.csv"))
+        sub.add_argument("--series-descriptions", type=Path, default=Path("train_series_descriptions.csv"))
+        sub.add_argument("--label-coordinates", type=Path, default=Path("train_label_coordinates.csv"))
+        sub.add_argument("--labels", type=Path, default=Path("train.csv"))
         sub.add_argument("--verbose", action="store_true")
     repair = subparsers.choices["repair"]
     repair.add_argument("--output", type=Path, default=Path("repaired"))
@@ -448,36 +530,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     normalize.add_argument("--target-spacing", type=_parse_spacing, default=(5.0, 0.5, 0.5))
     normalize.add_argument("--clip-low", type=float, default=0.05)
     normalize.add_argument("--clip-high", type=float, default=99.5)
+    normalize.add_argument("--intensity-mode", choices=("raw", "zscore"), default="raw")
+    normalize.add_argument("--interpolation-order", type=int, choices=(0, 1, 3), default=1)
     args = parser.parse_args(argv)
-    # INFO output is useful for batch runs; warnings remain visible by default.
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s: %(message)s")
-
-    # Fail before scanning if the input path is invalid.
+    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
+                        format="%(levelname)s: %(message)s")
     if not args.input.is_dir():
         parser.error(f"input directory does not exist: {args.input}")
-    # Every command first discovers series and writes an audit manifest.
-    series = discover_series(args.input)
-    write_manifest(series, args.manifest)
-    LOG.info("Discovered %d series; manifest written to %s", len(series), args.manifest)
-    if args.command == "repair":
-        # Reuse one study UID for all repaired series belonging to one patient.
-        studies: dict[str, str] = {}
-        for item in series:
-            studies.setdefault(item.patient_id, generate_uid())
-            repair_series(item, args.output, studies[item.patient_id])
-    elif args.command == "normalize":
-        try:
+    try:
+        series = discover_series(args.input, args.series_descriptions, args.label_coordinates, args.labels)
+        write_manifest(series, args.manifest)
+        write_slice_manifest(series, args.manifest.with_name(args.manifest.stem + "_slices.csv"))
+        LOG.info("Discovered %d series; manifests written to %s", len(series), args.manifest)
+        if args.command == "repair":
             for item in series:
-                # Include patient, label, and UID suffix to prevent collisions.
-                output = args.output / _safe_id(item.patient_id) / f"{item.label}_{_safe_id(item.series_uid[-12:])}.npy"
-                _normalise_volume(item, output, args.target_spacing, args.clip_low, args.clip_high)
-        except RuntimeError as exc:
-            # Convert an optional-dependency failure into a useful CLI message.
-            LOG.error("%s", exc)
-            return 2
+                repair_series(item, args.output)
+        elif args.command == "normalize":
+            for item in series:
+                output = args.output / _safe_id(item.patient_id) / (
+                    f"{item.label}_{_safe_id(item.series_uid[-12:])}_part{item.part_index}.nii.gz"
+                )
+                _normalise_volume(item, output, args.target_spacing, args.clip_low,
+                                  args.clip_high, args.intensity_mode, args.interpolation_order)
+    except (ImportError, RuntimeError, ValueError) as exc:
+        LOG.error("%s", exc)
+        return 2
     return 0
 
 
 if __name__ == "__main__":
-    # Propagate the command's exit status to the operating system.
     sys.exit(main())
